@@ -1,0 +1,286 @@
+name: portfolios-tracker-data
+
+x-airflow-common: &airflow-common
+  image: portfolios-tracker-airflow:latest
+  build:
+    context: .
+    dockerfile: Dockerfile
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: "${AIRFLOW__CORE__FERNET_KEY}"
+    AIRFLOW__API__SECRET_KEY: "${AIRFLOW__API__SECRET_KEY}"
+    AIRFLOW__API_AUTH__JWT_SECRET: "${AIRFLOW__API_AUTH__JWT_SECRET}"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__HOSTNAME_CALLABLE: "airflow.utils.net.get_host_ip_address"
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-apiserver:8080/execution/"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    AIRFLOW_CONFIG: "/opt/airflow/config/airflow.cfg"
+    PYTHONPATH: "/opt/airflow"
+    NUMBA_CACHE_DIR: /tmp
+    NESTJS_API_URL: "${NESTJS_API_URL:-http://host.docker.internal:3001}"
+    TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+    TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID}"
+    GEMINI_API_KEY: "${GEMINI_API_KEY}"
+    SUPABASE_URL: "${SUPABASE_URL}"
+    SUPABASE_SECRET_OR_SERVICE_ROLE_KEY: "${SUPABASE_SECRET_OR_SERVICE_ROLE_KEY}"
+    SUPABASE_DB_URL: "${SUPABASE_DB_URL:-}"
+    DATA_PIPELINE_API_KEY: "${DATA_PIPELINE_API_KEY}"
+    AIRFLOW_POOL_VCI_GRAPHQL_SLOTS: "${AIRFLOW_POOL_VCI_GRAPHQL_SLOTS:-8}"
+    AIRFLOW_POOL_KBS_FINANCE_SLOTS: "${AIRFLOW_POOL_KBS_FINANCE_SLOTS:-8}"
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./config:/opt/airflow/config
+    - ./plugins:/opt/airflow/plugins
+    - ./scripts:/opt/airflow/scripts
+    - ./sql:/opt/airflow/sql
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - airflow-backend
+  depends_on: &airflow-common-depends-on
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    networks:
+      - airflow-backend
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+  redis:
+    image: redis:7.2-bookworm
+    networks:
+      - airflow-backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo -e "\033[1;33mWARNING: AIRFLOW_UID not set!\e[0m"
+          export AIRFLOW_UID=$$(id -u)
+        fi
+        mkdir -v -p /opt/airflow/{logs,dags,plugins,config}
+        /entrypoint airflow db migrate
+        airflow users create \
+          --username "${_AIRFLOW_WWW_USER_USERNAME:-airflow}" \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password "${_AIRFLOW_WWW_USER_PASSWORD:-airflow}" 2>/dev/null || echo "User already exists"
+        su airflow -s /bin/bash -c "/opt/airflow/scripts/bootstrap-airflow-pools.sh" || echo "Pool bootstrap skipped"
+        chown -R "${AIRFLOW_UID}:0" /opt/airflow/{logs,dags,plugins,config}
+        chmod -R g+rwX /opt/airflow/logs
+        find /opt/airflow/logs -type d -exec chmod g+s {} +
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: "${_AIRFLOW_WWW_USER_USERNAME:-airflow}"
+      _AIRFLOW_WWW_USER_PASSWORD: "${_AIRFLOW_WWW_USER_PASSWORD:-airflow}"
+    user: "0:0"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 512M
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 512M
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 256M
+
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-apiserver:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 256M
+
+  flower:
+    <<: *airflow-common
+    command: celery flower
+    ports:
+      - "5555:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 128M
+
+networks:
+  airflow-backend:
+    driver: bridge
+
+volumes:
+  postgres-db-volume:
